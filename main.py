@@ -216,27 +216,31 @@ async def process(file: UploadFile = File(...), x_service_token: str = Header(de
         "desviacion_60_40": abs(pct_elec - 60) > 15,
     }
 
-    # ---- Escribir totales en el Excel (columnas detectadas por título) ----
-    def setc(row, key, value):
-        ws.cell(row=row, column=colmap[key]).value = value
+    # ---- Beneficio susceptible SOLO de pagos electrónicos ----
+    benef_elec = sum(f["valor_beneficio"] for f in facturas
+                     if classify_medio(f["medio_pago"]) == "electronico")
+    base_fact_nc = t_fact - t_nc  # Facturado - Notas Crédito (base de porcentajes)
+    pct_benef = round(benef_elec / base_fact_nc * 100, 1) if base_fact_nc else 0.0
 
-    rt = last_row + 2
-    setc(rt, "nit_emisor", "TOTALES")
-    setc(rt, "valor_facturado", t_fact)
-    setc(rt, "notas_credito", t_nc)
-    setc(rt, "notas_debito", t_nd)
-    setc(rt, "valor_neto", t_neto)
-    setc(rt, "valor_beneficio", t_benef)
-
-    r60 = last_row + 4
-    setc(r60, "nit_emisor", "60% Electronico (estimado)")
-    setc(r60, "notas_credito", 0.6)
-    setc(r60, "valor_neto", round(0.6 * t_neto))
-
-    r40 = last_row + 6
-    setc(r40, "nit_emisor", "40% Efectivo (estimado)")
-    setc(r40, "notas_credito", 0.4)
-    setc(r40, "valor_neto", round(0.4 * t_neto))
+    # ---- Escribir tabla de resultados al final del Excel ----
+    # El marcador DIAN ("...Facturas procesadas disponibles") queda en last_row+1;
+    # la tabla inicia en last_row+3 dejando una fila en blanco.
+    col_label = colmap["nit_emisor"]
+    col_valor = colmap["valor_facturado"]
+    start = last_row + 3
+    tabla = [
+        ("Facturado - Notas Crédito", base_fact_nc, "#,##0"),
+        ("Valor Susceptible Beneficio (Electrónicos)", benef_elec, "#,##0"),
+        ("60% (Facturado - NC)", round(0.6 * base_fact_nc), "#,##0"),
+        ("40% (Facturado - NC)", round(0.4 * base_fact_nc), "#,##0"),
+        ("% Beneficio / (Facturado - NC)",
+         (benef_elec / base_fact_nc) if base_fact_nc else 0, "0.0%"),
+    ]
+    for i, (label, value, fmt) in enumerate(tabla):
+        ws.cell(row=start + i, column=col_label).value = label
+        cell = ws.cell(row=start + i, column=col_valor)
+        cell.value = value
+        cell.number_format = fmt
 
     out = io.BytesIO()
     wb.save(out)
@@ -250,6 +254,13 @@ async def process(file: UploadFile = File(...), x_service_token: str = Header(de
         "totales": {"valor_facturado": t_fact, "notas_credito": t_nc, "notas_debito": t_nd,
                     "valor_neto": t_neto, "valor_beneficio": t_benef},
         "beneficio_1pct": benef_1pct,
+        "tabla_final": {
+            "facturado_menos_nc": base_fact_nc,
+            "beneficio_electronicos": benef_elec,
+            "estimado_60": round(0.6 * base_fact_nc),
+            "estimado_40": round(0.4 * base_fact_nc),
+            "pct_beneficio_sobre_base": pct_benef,
+        },
         "medios": medios,
         "pct_real": {"electronico": pct_elec, "efectivo": pct_efec},
         "alertas": alertas,
