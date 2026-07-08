@@ -18,7 +18,7 @@ from fastapi import FastAPI, UploadFile, File, Header, HTTPException
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.2")
+app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.3")
 
 SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "")  # si está vacío, no exige token
 SHEET_NAME = "COMPRAS FC ELEC"
@@ -173,11 +173,11 @@ def _bump_collection(xml: str, tag: str, items_xml: str, n_items: int):
     return xml, old
 
 
-# Paleta corporativa de la tabla de resultados
-C_TITULO_FONDO = "FF1F3864"   # azul marino
-C_HEADER_FONDO = "FF4472C4"   # azul medio
-C_LABEL_FONDO = "FFD9E2F2"    # azul claro
-C_TEXTO_OSCURO = "FF1F3864"
+# Paleta corporativa de la tabla de resultados (gama verde)
+C_TITULO_FONDO = "FF375623"   # verde oscuro
+C_HEADER_FONDO = "FF70AD47"   # verde medio
+C_LABEL_FONDO = "FFE2EFDA"    # verde claro
+C_TEXTO_OSCURO = "FF375623"
 
 
 def _augment_styles(styles_xml: str) -> tuple:
@@ -247,7 +247,7 @@ def write_results_table(content: bytes, sheet_title: str, last_row: int,
     sxml = zin.read(sheet_path).decode("utf-8")
     styles_xml, st = _augment_styles(zin.read("xl/styles.xml").decode("utf-8"))
 
-    col_l, col_v = "B", "C"
+    col_l, col_v = "C", "D"
 
     existing = [int(x) for x in re.findall(r'<row r="(\d+)"', sxml)]
     max_existing = max(existing) if existing else last_row
