@@ -18,7 +18,7 @@ from fastapi import FastAPI, UploadFile, File, Header, HTTPException
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.3")
+app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.4")
 
 SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "")  # si está vacío, no exige token
 SHEET_NAME = "COMPRAS FC ELEC"
@@ -248,6 +248,20 @@ def write_results_table(content: bytes, sheet_title: str, last_row: int,
     styles_xml, st = _augment_styles(zin.read("xl/styles.xml").decode("utf-8"))
 
     col_l, col_v = "C", "D"
+
+    # Idempotencia: si ya hay una tabla de resultados de una corrida anterior,
+    # eliminarla (título + encabezados + 5 filas de datos) antes de escribir.
+    row_re = re.compile(r'<row r="(\d+)"[^>]*?(?:/>|>.*?</row>)', re.DOTALL)
+    title_row = None
+    for m in row_re.finditer(sxml):
+        if "RESULTADOS COMPRAS FC ELEC" in m.group(0):
+            title_row = int(m.group(1))
+            break
+    if title_row is not None:
+        def _drop(m):
+            n = int(m.group(1))
+            return "" if title_row <= n <= title_row + 6 else m.group(0)
+        sxml = row_re.sub(_drop, sxml)
 
     existing = [int(x) for x in re.findall(r'<row r="(\d+)"', sxml)]
     max_existing = max(existing) if existing else last_row
