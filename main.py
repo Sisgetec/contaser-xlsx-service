@@ -18,7 +18,7 @@ from fastapi import FastAPI, UploadFile, File, Header, HTTPException
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.1")
+app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.2")
 
 SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "")  # si está vacío, no exige token
 SHEET_NAME = "COMPRAS FC ELEC"
@@ -158,64 +158,140 @@ def _sheet_xml_path(z: zipfile.ZipFile, sheet_title: str) -> str:
     return target[1:] if target.startswith("/") else "xl/" + target
 
 
-def _cell_style(sheet_xml: str, ref_row: int, col_letter: str) -> str:
-    """Devuelve el atributo s=".." de la celda de referencia, o cadena vacía."""
-    rm = re.search(r'<row r="%d"\b.*?(?:</row>|/>)' % ref_row, sheet_xml, re.DOTALL)
-    if not rm:
-        return ""
-    cm = re.search(r'<c r="%s%d"([^>]*)>' % (col_letter, ref_row), rm.group(0))
-    if not cm:
-        return ""
-    sm = re.search(r'\bs="(\d+)"', cm.group(1))
-    return ' s="%s"' % sm.group(1) if sm else ""
+def _bump_collection(xml: str, tag: str, items_xml: str, n_items: int):
+    """Suma n_items al count de <tag> e inserta items antes de </tag>.
+    Devuelve (xml_modificado, índice_inicial_de_los_nuevos_items)."""
+    m = re.search(r'<%s count="(\d+)"' % tag, xml)
+    if not m:
+        raise HTTPException(500, f"styles.xml sin colección <{tag}>")
+    old = int(m.group(1))
+    xml = xml[:m.start(1)] + str(old + n_items) + xml[m.end(1):]
+    close = xml.find("</%s>" % tag)
+    if close == -1:
+        raise HTTPException(500, f"styles.xml sin cierre </{tag}>")
+    xml = xml[:close] + items_xml + xml[close:]
+    return xml, old
+
+
+# Paleta corporativa de la tabla de resultados
+C_TITULO_FONDO = "FF1F3864"   # azul marino
+C_HEADER_FONDO = "FF4472C4"   # azul medio
+C_LABEL_FONDO = "FFD9E2F2"    # azul claro
+C_TEXTO_OSCURO = "FF1F3864"
+
+
+def _augment_styles(styles_xml: str) -> tuple:
+    """Agrega fuentes/rellenos/bordes/formatos y 5 estilos de celda nuevos.
+    Devuelve (styles_xml_nuevo, dict_estilos)."""
+    # Formato de porcentaje 0.0% (id personalizado libre)
+    ids = [int(x) for x in re.findall(r'numFmtId="(\d+)"', styles_xml)]
+    pct_id = max([163] + ids) + 1
+    numfmt = '<numFmt numFmtId="%d" formatCode="0.0%%"/>' % pct_id
+    m = re.search(r'<numFmts count="(\d+)">', styles_xml)
+    if m:
+        styles_xml = styles_xml[:m.start(1)] + str(int(m.group(1)) + 1) + styles_xml[m.end(1):]
+        close = styles_xml.find("</numFmts>")
+        styles_xml = styles_xml[:close] + numfmt + styles_xml[close:]
+    else:
+        m2 = re.search(r"<styleSheet[^>]*>", styles_xml)
+        styles_xml = (styles_xml[:m2.end()]
+                      + '<numFmts count="1">%s</numFmts>' % numfmt
+                      + styles_xml[m2.end():])
+
+    fonts = (
+        '<font><b/><sz val="12"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="11"/><color rgb="%s"/><name val="Calibri"/></font>' % C_TEXTO_OSCURO
+    )
+    styles_xml, f0 = _bump_collection(styles_xml, "fonts", fonts, 3)
+
+    fills = (
+        '<fill><patternFill patternType="solid"><fgColor rgb="%s"/><bgColor indexed="64"/></patternFill></fill>' % C_TITULO_FONDO
+        + '<fill><patternFill patternType="solid"><fgColor rgb="%s"/><bgColor indexed="64"/></patternFill></fill>' % C_HEADER_FONDO
+        + '<fill><patternFill patternType="solid"><fgColor rgb="%s"/><bgColor indexed="64"/></patternFill></fill>' % C_LABEL_FONDO
+    )
+    styles_xml, l0 = _bump_collection(styles_xml, "fills", fills, 3)
+
+    border = ('<border><left style="thin"><color indexed="64"/></left>'
+              '<right style="thin"><color indexed="64"/></right>'
+              '<top style="thin"><color indexed="64"/></top>'
+              '<bottom style="thin"><color indexed="64"/></bottom><diagonal/></border>')
+    styles_xml, b0 = _bump_collection(styles_xml, "borders", border, 1)
+
+    xfs = (
+        # título (banda azul marino, texto blanco centrado)
+        '<xf numFmtId="0" fontId="%d" fillId="%d" borderId="%d" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>' % (f0, l0, b0)
+        # encabezados Concepto/Valor (azul medio, texto blanco)
+        + '<xf numFmtId="0" fontId="%d" fillId="%d" borderId="%d" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>' % (f0 + 1, l0 + 1, b0)
+        # etiquetas (azul claro, texto azul oscuro en negrilla)
+        + '<xf numFmtId="0" fontId="%d" fillId="%d" borderId="%d" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>' % (f0 + 2, l0 + 2, b0)
+        # valores numéricos con miles (#,##0 = formato incorporado 3)
+        + '<xf numFmtId="3" fontId="0" fillId="0" borderId="%d" xfId="0" applyNumberFormat="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>' % b0
+        # porcentaje 0.0%%
+        + '<xf numFmtId="%d" fontId="0" fillId="0" borderId="%d" xfId="0" applyNumberFormat="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>' % (pct_id, b0)
+    )
+    styles_xml, x0 = _bump_collection(styles_xml, "cellXfs", xfs, 5)
+
+    estilos = {"titulo": x0, "header": x0 + 1, "label": x0 + 2,
+               "money": x0 + 3, "pct": x0 + 4}
+    return styles_xml, estilos
 
 
 def write_results_table(content: bytes, sheet_title: str, last_row: int,
-                        col_label_idx: int, col_valor_idx: int,
                         tabla: list) -> bytes:
-    """tabla: lista de (etiqueta, valor) donde valor int -> numérico, str -> texto."""
+    """Escribe la tabla de resultados en columnas B y C con título,
+    encabezados, colores y formatos numéricos. tabla: [(label, value, kind)]
+    con kind en {money, pct}."""
     zin = zipfile.ZipFile(io.BytesIO(content))
     sheet_path = _sheet_xml_path(zin, sheet_title)
     sxml = zin.read(sheet_path).decode("utf-8")
+    styles_xml, st = _augment_styles(zin.read("xl/styles.xml").decode("utf-8"))
 
-    col_l = get_column_letter(col_label_idx)
-    col_v = get_column_letter(col_valor_idx)
+    col_l, col_v = "B", "C"
 
-    # Inicio de la tabla: después del marcador DIAN y de cualquier fila ya
-    # existente en el XML (garantiza orden ascendente de filas = sin merge).
     existing = [int(x) for x in re.findall(r'<row r="(\d+)"', sxml)]
     max_existing = max(existing) if existing else last_row
     start = max(last_row + 3, max_existing + 2)
 
-    # Reutilizar estilos de una factura real para que el formato coincida
-    style_label = _cell_style(sxml, last_row, col_l)
-    style_valor = _cell_style(sxml, last_row, col_v)
+    def txt(col, r, s, text):
+        return ('<c r="%s%d" s="%d" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
+                % (col, r, s, escape(str(text))))
 
     rows_xml = []
-    for i, (label, value) in enumerate(tabla):
-        r = start + i
-        lbl = ('<c r="%s%d"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
-               % (col_l, r, style_label, escape(str(label))))
-        if isinstance(value, (int, float)):
-            val = '<c r="%s%d"%s><v>%s</v></c>' % (col_v, r, style_valor, value)
-        else:
-            val = ('<c r="%s%d"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
-                   % (col_v, r, style_valor, escape(str(value))))
-        cells = (lbl + val) if col_label_idx < col_valor_idx else (val + lbl)
-        rows_xml.append('<row r="%d">%s</row>' % (r, cells))
+    # Fila título (banda en B y C)
+    rows_xml.append('<row r="%d" ht="20" customHeight="1">%s%s</row>' % (
+        start,
+        txt(col_l, start, st["titulo"], "RESULTADOS COMPRAS FC ELEC"),
+        txt(col_v, start, st["titulo"], ""),
+    ))
+    # Fila encabezados
+    rows_xml.append("<row r=\"%d\">%s%s</row>" % (
+        start + 1,
+        txt(col_l, start + 1, st["header"], "Concepto"),
+        txt(col_v, start + 1, st["header"], "Valor"),
+    ))
+    # Filas de datos
+    for i, (label, value, kind) in enumerate(tabla):
+        r = start + 2 + i
+        s_val = st["pct"] if kind == "pct" else st["money"]
+        val = '<c r="%s%d" s="%d"><v>%s</v></c>' % (col_v, r, s_val, value)
+        rows_xml.append('<row r="%d">%s%s</row>' % (
+            r, txt(col_l, r, st["label"], label), val))
 
     idx = sxml.rfind("</sheetData>")
     if idx == -1:
         raise HTTPException(500, "XML de hoja sin </sheetData>; estructura inesperada")
     new_sxml = sxml[:idx] + "".join(rows_xml) + sxml[idx:]
 
-    # Reempaquetar: todo idéntico excepto el XML de esta hoja
+    # Reempaquetar: todo idéntico excepto la hoja y styles.xml
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
             data = zin.read(item.filename)
             if item.filename == sheet_path:
                 data = new_sxml.encode("utf-8")
+            elif item.filename == "xl/styles.xml":
+                data = styles_xml.encode("utf-8")
             zi = zipfile.ZipInfo(item.filename, date_time=item.date_time)
             zi.compress_type = item.compress_type
             zi.external_attr = item.external_attr
@@ -323,18 +399,17 @@ async def process(file: UploadFile = File(...), x_service_token: str = Header(de
         return int(round(v))
 
     tabla = [
-        ("Facturado - Notas Crédito", money(base_fact_nc)),
-        ("Valor Susceptible Beneficio (Electrónicos)", money(benef_elec)),
-        ("60% (Facturado - NC)", money(0.6 * base_fact_nc)),
-        ("40% (Facturado - NC)", money(0.4 * base_fact_nc)),
-        ("% Beneficio / (Facturado - NC)", ("%.1f%%" % pct_benef).replace(".", ",")),
+        ("Facturado - Notas Crédito", money(base_fact_nc), "money"),
+        ("Valor Susceptible Beneficio (Electrónicos)", money(benef_elec), "money"),
+        ("60% (Facturado - NC)", money(0.6 * base_fact_nc), "money"),
+        ("40% (Facturado - NC)", money(0.4 * base_fact_nc), "money"),
+        # como fracción: Excel lo muestra 91,8% gracias al formato 0.0%
+        ("% Beneficio / (Facturado - NC)",
+         round(benef_elec / base_fact_nc, 4) if base_fact_nc else 0, "pct"),
     ]
 
     # ---- Escritura quirúrgica sobre los bytes ORIGINALES ----
-    nuevo = write_results_table(
-        content, ws.title, last_row,
-        colmap["nit_emisor"], colmap["valor_facturado"], tabla,
-    )
+    nuevo = write_results_table(content, ws.title, last_row, tabla)
     archivo_b64 = base64.b64encode(nuevo).decode()
 
     return {
