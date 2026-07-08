@@ -1,24 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-Microservicio Contaser - Módulo 1: COMPRAS FC ELEC
-Lee un .xlsm (preservando macros y todas las hojas), extrae y calcula la hoja
-"COMPRAS FC ELEC", escribe los totales y devuelve resultados + archivo modificado.
+Microservicio Contaser - Módulo 1: COMPRAS FC ELEC (v1.1)
+Lee un .xlsm, calcula la hoja "COMPRAS FC ELEC" y escribe la tabla de
+resultados mediante EDICIÓN QUIRÚRGICA del XML interno: solo se modifica
+el XML de esa hoja; el resto del archivo (58 hojas, macros, dibujos,
+vínculos externos) se copia byte por byte, evitando corrupción.
 """
 import base64
 import io
 import os
+import re
+import zipfile
 from datetime import datetime, date
+from xml.sax.saxutils import escape, unescape
 
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException
 import openpyxl
+from openpyxl.utils import get_column_letter
 
-app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.0")
+app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.1")
 
 SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "")  # si está vacío, no exige token
 SHEET_NAME = "COMPRAS FC ELEC"
 END_MARKER = "facturas procesadas disponibles"
 
-# Título de encabezado de datos -> clave interna
 COL_LABELS = {
     "identificación emisor factura": "nit_emisor",
     "nombre emisor factura": "nombre_emisor",
@@ -127,9 +132,101 @@ def parse_header(ws, header_row):
     return anio, nit, nombre
 
 
+# ---------------------------------------------------------------------------
+# Escritura quirúrgica del XML de la hoja (sin reescribir el resto del libro)
+# ---------------------------------------------------------------------------
+
+def _sheet_xml_path(z: zipfile.ZipFile, sheet_title: str) -> str:
+    wb_xml = z.read("xl/workbook.xml").decode("utf-8")
+    rid = None
+    for sm in re.finditer(r"<sheet\b[^>]*>", wb_xml):
+        tag = sm.group(0)
+        nm = re.search(r'name="([^"]*)"', tag)
+        if nm and unescape(nm.group(1)) == sheet_title:
+            rm = re.search(r'r:id="([^"]*)"', tag)
+            if rm:
+                rid = rm.group(1)
+            break
+    if not rid:
+        raise HTTPException(500, f"No se encontró la hoja '{sheet_title}' en workbook.xml")
+    rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    rel = re.search(r'<Relationship\b[^>]*\bId="%s"[^>]*/?>' % re.escape(rid), rels)
+    if not rel:
+        raise HTTPException(500, f"No se encontró la relación {rid} de la hoja")
+    tm = re.search(r'Target="([^"]*)"', rel.group(0))
+    target = tm.group(1)
+    return target[1:] if target.startswith("/") else "xl/" + target
+
+
+def _cell_style(sheet_xml: str, ref_row: int, col_letter: str) -> str:
+    """Devuelve el atributo s=".." de la celda de referencia, o cadena vacía."""
+    rm = re.search(r'<row r="%d"\b.*?(?:</row>|/>)' % ref_row, sheet_xml, re.DOTALL)
+    if not rm:
+        return ""
+    cm = re.search(r'<c r="%s%d"([^>]*)>' % (col_letter, ref_row), rm.group(0))
+    if not cm:
+        return ""
+    sm = re.search(r'\bs="(\d+)"', cm.group(1))
+    return ' s="%s"' % sm.group(1) if sm else ""
+
+
+def write_results_table(content: bytes, sheet_title: str, last_row: int,
+                        col_label_idx: int, col_valor_idx: int,
+                        tabla: list) -> bytes:
+    """tabla: lista de (etiqueta, valor) donde valor int -> numérico, str -> texto."""
+    zin = zipfile.ZipFile(io.BytesIO(content))
+    sheet_path = _sheet_xml_path(zin, sheet_title)
+    sxml = zin.read(sheet_path).decode("utf-8")
+
+    col_l = get_column_letter(col_label_idx)
+    col_v = get_column_letter(col_valor_idx)
+
+    # Inicio de la tabla: después del marcador DIAN y de cualquier fila ya
+    # existente en el XML (garantiza orden ascendente de filas = sin merge).
+    existing = [int(x) for x in re.findall(r'<row r="(\d+)"', sxml)]
+    max_existing = max(existing) if existing else last_row
+    start = max(last_row + 3, max_existing + 2)
+
+    # Reutilizar estilos de una factura real para que el formato coincida
+    style_label = _cell_style(sxml, last_row, col_l)
+    style_valor = _cell_style(sxml, last_row, col_v)
+
+    rows_xml = []
+    for i, (label, value) in enumerate(tabla):
+        r = start + i
+        lbl = ('<c r="%s%d"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
+               % (col_l, r, style_label, escape(str(label))))
+        if isinstance(value, (int, float)):
+            val = '<c r="%s%d"%s><v>%s</v></c>' % (col_v, r, style_valor, value)
+        else:
+            val = ('<c r="%s%d"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
+                   % (col_v, r, style_valor, escape(str(value))))
+        cells = (lbl + val) if col_label_idx < col_valor_idx else (val + lbl)
+        rows_xml.append('<row r="%d">%s</row>' % (r, cells))
+
+    idx = sxml.rfind("</sheetData>")
+    if idx == -1:
+        raise HTTPException(500, "XML de hoja sin </sheetData>; estructura inesperada")
+    new_sxml = sxml[:idx] + "".join(rows_xml) + sxml[idx:]
+
+    # Reempaquetar: todo idéntico excepto el XML de esta hoja
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == sheet_path:
+                data = new_sxml.encode("utf-8")
+            zi = zipfile.ZipInfo(item.filename, date_time=item.date_time)
+            zi.compress_type = item.compress_type
+            zi.external_attr = item.external_attr
+            zout.writestr(zi, data)
+    zin.close()
+    return out.getvalue()
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "contaser-xlsx", "version": "1.0"}
+    return {"status": "ok", "service": "contaser-xlsx", "version": "1.1"}
 
 
 @app.post("/process")
@@ -216,35 +313,29 @@ async def process(file: UploadFile = File(...), x_service_token: str = Header(de
         "desviacion_60_40": abs(pct_elec - 60) > 15,
     }
 
-    # ---- Beneficio susceptible SOLO de pagos electrónicos ----
+    # ---- Tabla final: base = Facturado - Notas Crédito ----
     benef_elec = sum(f["valor_beneficio"] for f in facturas
                      if classify_medio(f["medio_pago"]) == "electronico")
-    base_fact_nc = t_fact - t_nc  # Facturado - Notas Crédito (base de porcentajes)
+    base_fact_nc = t_fact - t_nc
     pct_benef = round(benef_elec / base_fact_nc * 100, 1) if base_fact_nc else 0.0
 
-    # ---- Escribir tabla de resultados al final del Excel ----
-    # El marcador DIAN ("...Facturas procesadas disponibles") queda en last_row+1;
-    # la tabla inicia en last_row+3 dejando una fila en blanco.
-    col_label = colmap["nit_emisor"]
-    col_valor = colmap["valor_facturado"]
-    start = last_row + 3
-    tabla = [
-        ("Facturado - Notas Crédito", base_fact_nc, "#,##0"),
-        ("Valor Susceptible Beneficio (Electrónicos)", benef_elec, "#,##0"),
-        ("60% (Facturado - NC)", round(0.6 * base_fact_nc), "#,##0"),
-        ("40% (Facturado - NC)", round(0.4 * base_fact_nc), "#,##0"),
-        ("% Beneficio / (Facturado - NC)",
-         (benef_elec / base_fact_nc) if base_fact_nc else 0, "0.0%"),
-    ]
-    for i, (label, value, fmt) in enumerate(tabla):
-        ws.cell(row=start + i, column=col_label).value = label
-        cell = ws.cell(row=start + i, column=col_valor)
-        cell.value = value
-        cell.number_format = fmt
+    def money(v):
+        return int(round(v))
 
-    out = io.BytesIO()
-    wb.save(out)
-    archivo_b64 = base64.b64encode(out.getvalue()).decode()
+    tabla = [
+        ("Facturado - Notas Crédito", money(base_fact_nc)),
+        ("Valor Susceptible Beneficio (Electrónicos)", money(benef_elec)),
+        ("60% (Facturado - NC)", money(0.6 * base_fact_nc)),
+        ("40% (Facturado - NC)", money(0.4 * base_fact_nc)),
+        ("% Beneficio / (Facturado - NC)", ("%.1f%%" % pct_benef).replace(".", ",")),
+    ]
+
+    # ---- Escritura quirúrgica sobre los bytes ORIGINALES ----
+    nuevo = write_results_table(
+        content, ws.title, last_row,
+        colmap["nit_emisor"], colmap["valor_facturado"], tabla,
+    )
+    archivo_b64 = base64.b64encode(nuevo).decode()
 
     return {
         "cliente": {"nit": str(nit).strip() if nit else "", "nombre": str(nombre).strip() if nombre else "",
@@ -255,10 +346,10 @@ async def process(file: UploadFile = File(...), x_service_token: str = Header(de
                     "valor_neto": t_neto, "valor_beneficio": t_benef},
         "beneficio_1pct": benef_1pct,
         "tabla_final": {
-            "facturado_menos_nc": base_fact_nc,
-            "beneficio_electronicos": benef_elec,
-            "estimado_60": round(0.6 * base_fact_nc),
-            "estimado_40": round(0.4 * base_fact_nc),
+            "facturado_menos_nc": money(base_fact_nc),
+            "beneficio_electronicos": money(benef_elec),
+            "estimado_60": money(0.6 * base_fact_nc),
+            "estimado_40": money(0.4 * base_fact_nc),
             "pct_beneficio_sobre_base": pct_benef,
         },
         "medios": medios,
