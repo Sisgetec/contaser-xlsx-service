@@ -43,6 +43,27 @@ Limitaciones conocidas: la detección de rangos es heurística (regex sobre el X
 no evalúa fórmulas indirectas (`INDIRECTO`, `DESREF`) ni referencias generadas por
 macros VBA. Las listas se truncan a 200 elementos (`resumen.listas_truncadas`).
 
+## Cambios de la v1.7
+
+Tres correcciones sobre problemas confirmados con archivos reales:
+
+1. **Nombre de cliente vacío.** `parse_header` comparaba las etiquetas por
+   igualdad exacta contra `"nombre"`. El export de la DIAN cambia de formato
+   entre versiones: RAMIREZ trae `"Nombre"` pero CUADROS, PAREDES y ALVARO
+   traen `"Nombre o razón social"` — **3 de cada 4 archivos fallaban**. Ahora
+   se normaliza sin tildes ni dos puntos y se compara **por prefijo**. Si aun
+   así queda vacío, cae al nombre del archivo sin extensión ni sufijo ` - AAAA`.
+2. **Tabla duplicada.** La idempotencia buscaba el texto del marcador dentro
+   del XML de la hoja. Si alguien abre el archivo en Excel y lo guarda, Excel
+   mueve ese texto a `xl/sharedStrings.xml` y la celda pasa a `<c t="s">`; el
+   marcador ya no se encontraba y se escribía una **segunda** tabla. Ahora
+   también se resuelven los índices de `sharedStrings`.
+3. **Validación de salida** (`validar_salida`). Antes de devolver el archivo se
+   comprueba que no falte ninguna entrada del ZIP, que `xl/vbaProject.bin` sea
+   **idéntico byte a byte**, que los CRC sean válidos, que abra con openpyxl y
+   que conserve el mismo número de hojas. Si algo falla se lanza HTTP 500 y la
+   ejecución de n8n se detiene **antes** del nodo que sobrescribe el original.
+
 ## Variables de entorno
 - `SERVICE_TOKEN` (opcional): si se define, las peticiones a `/process` deben
   enviar el header `X-Service-Token` con ese valor.

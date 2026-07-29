@@ -10,6 +10,7 @@ import base64
 import io
 import os
 import re
+import unicodedata
 import zipfile
 from datetime import datetime, date
 from xml.sax.saxutils import escape, unescape
@@ -18,11 +19,14 @@ from fastapi import FastAPI, UploadFile, File, Header, HTTPException
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.6")
+app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.7")
 
 SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "")  # si está vacío, no exige token
 SHEET_NAME = "COMPRAS FC ELEC"
 END_MARKER = "facturas procesadas disponibles"
+# Título de la tabla que insertamos. Sirve además como marcador de idempotencia:
+# si ya existe en la hoja, se borra la tabla anterior antes de escribir la nueva.
+MARCADOR_TABLA = "RESULTADOS COMPRAS FC ELEC"
 
 COL_LABELS = {
     "identificación emisor factura": "nit_emisor",
@@ -40,6 +44,33 @@ COL_LABELS = {
 
 def _norm(s):
     return str(s).strip().lower() if s is not None else ""
+
+
+def _sin_tildes(s):
+    return "".join(c for c in unicodedata.normalize("NFD", str(s))
+                   if unicodedata.category(c) != "Mn")
+
+
+def _norm_label(s):
+    """Normaliza una etiqueta del header para compararla con tolerancia.
+
+    Quita tildes, pasa a minúsculas, convierte los dos puntos en espacio y
+    colapsa espacios múltiples. Necesario porque el export de la DIAN cambia
+    de formato entre versiones: 'Nombre' en unos archivos y 'Nombre o razón
+    social' en otros, 'Identificacion ' con espacio final, etc.
+    """
+    t = _sin_tildes(s or "").lower().replace(":", " ")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def nombre_desde_archivo(nombre_archivo):
+    """Fallback del nombre de cliente: usa el nombre del archivo sin extensión
+    ni el sufijo ' - AAAA'. Devuelve '' si no se puede derivar nada."""
+    if not nombre_archivo:
+        return ""
+    base = re.sub(r"\.(xlsm|xlsx)$", "", str(nombre_archivo), flags=re.I)
+    base = re.sub(r"\s*-\s*\d{4}\s*$", "", base)
+    return base.strip()
 
 
 def to_number(v):
@@ -118,7 +149,13 @@ def map_columns(ws, header_row):
     return colmap
 
 
-def parse_header(ws, header_row):
+def parse_header(ws, header_row, nombre_archivo=None):
+    """Extrae año gravable, NIT y nombre de las filas previas al encabezado.
+
+    Las etiquetas se comparan con `_norm_label` y por prefijo, no por igualdad:
+    'Nombre', 'Nombre o razón social' y 'Nombres y apellidos' deben funcionar
+    todas. Si aun así el nombre queda vacío, cae al nombre del archivo.
+    """
     anio = nit = nombre = None
     nit_row = None
     for r in range(1, header_row):
@@ -127,20 +164,29 @@ def parse_header(ws, header_row):
             cell = ws.cell(row=r, column=c).value
             if cell is not None and str(cell).strip() != "":
                 if label is None:
-                    label = _norm(cell)
+                    label = _norm_label(cell)
                 else:
                     valor = cell
                     break
-        if label == "año gravable":
+        if not label:
+            continue
+        if label.startswith("ano gravable"):        # 'Año Gravable' sin tilde
             anio = valor
         elif label == "nit":
             nit = valor
             nit_row = r
-        elif label == "nombre":
+        elif label.startswith("nombre"):
+            # La fila 1 trae label 'Nombre' con el título del informe: descartar.
+            if valor is None or _norm_label(valor).startswith("informe"):
+                continue
+            # Preferir la fila posterior al NIT; si no hay, la primera válida.
             if nit_row is not None and r > nit_row:
                 nombre = valor
-            elif nombre is None and valor is not None and not str(valor).lower().startswith("informe"):
+            elif nombre is None:
                 nombre = valor
+
+    if nombre is None or str(nombre).strip() == "":
+        nombre = nombre_desde_archivo(nombre_archivo) or None
     return anio, nit, nombre
 
 
@@ -249,6 +295,26 @@ def _augment_styles(styles_xml: str) -> tuple:
     return styles_xml, estilos
 
 
+def _indices_sharedstrings(z: zipfile.ZipFile, texto: str) -> set:
+    """Índices de xl/sharedStrings.xml cuyo texto contiene `texto`.
+
+    Nosotros escribimos la tabla con inlineStr, pero si alguien abre el archivo
+    en Excel y lo guarda, Excel mueve esos textos a la tabla de cadenas
+    compartidas y la celda pasa a ser <c t="s"><v>N</v></c>. Sin esto, la
+    idempotencia no encontraría la tabla anterior y escribiría una segunda.
+    """
+    try:
+        ss = z.read("xl/sharedStrings.xml").decode("utf-8", errors="replace")
+    except KeyError:
+        return set()
+    encontrados = set()
+    for i, m in enumerate(re.finditer(r"<si\b[^>]*>(.*?)</si>", ss, re.DOTALL)):
+        plano = unescape(re.sub(r"<[^>]+>", "", m.group(1)))
+        if texto in plano:
+            encontrados.add(i)
+    return encontrados
+
+
 def write_results_table(content: bytes, sheet_title: str, last_row: int,
                         tabla: list) -> bytes:
     """Escribe la tabla de resultados en columnas B y C con título,
@@ -264,9 +330,18 @@ def write_results_table(content: bytes, sheet_title: str, last_row: int,
     # Idempotencia: si ya hay una tabla de resultados de una corrida anterior,
     # eliminarla (título + encabezados + 5 filas de datos) antes de escribir.
     row_re = re.compile(r'<row r="(\d+)"[^>]*?(?:/>|>.*?</row>)', re.DOTALL)
+    sst_idx = _indices_sharedstrings(zin, MARCADOR_TABLA)
+    cell_s_re = re.compile(r'<c\b[^>]*\bt="s"[^>]*>\s*<v>(\d+)</v>')
     title_row = None
     for m in row_re.finditer(sxml):
-        if "RESULTADOS COMPRAS FC ELEC" in m.group(0):
+        bloque = m.group(0)
+        # Caso 1: la tabla sigue como la escribimos (inlineStr).
+        if MARCADOR_TABLA in bloque:
+            title_row = int(m.group(1))
+            break
+        # Caso 2: Excel reguardó el archivo y el texto vive en sharedStrings.
+        if sst_idx and any(int(cm.group(1)) in sst_idx
+                           for cm in cell_s_re.finditer(bloque)):
             title_row = int(m.group(1))
             break
     if title_row is not None:
@@ -287,7 +362,7 @@ def write_results_table(content: bytes, sheet_title: str, last_row: int,
     # Fila título (banda en B y C)
     rows_xml.append('<row r="%d" ht="20" customHeight="1">%s%s</row>' % (
         start,
-        txt(col_l, start, st["titulo"], "RESULTADOS COMPRAS FC ELEC"),
+        txt(col_l, start, st["titulo"], MARCADOR_TABLA),
         txt(col_v, start, st["titulo"], ""),
     ))
     # Fila encabezados
@@ -326,9 +401,60 @@ def write_results_table(content: bytes, sheet_title: str, last_row: int,
     return out.getvalue()
 
 
+def validar_salida(original: bytes, nuevo: bytes, n_hojas: int):
+    """Comprueba la integridad del .xlsm generado ANTES de devolverlo.
+
+    Si algo no cuadra lanza 500: la ejecución de n8n se detiene y nunca llega
+    al nodo que sobrescribe el archivo original en Drive. El peor caso pasa a
+    ser 'no se procesó' en vez de 'se dañó el archivo del cliente'.
+    """
+    try:
+        zo = zipfile.ZipFile(io.BytesIO(original))
+    except Exception as e:
+        raise HTTPException(500, f"El archivo original no es un ZIP válido: {e}")
+    try:
+        zn = zipfile.ZipFile(io.BytesIO(nuevo))
+    except Exception as e:
+        zo.close()
+        raise HTTPException(500, f"El archivo generado no es un ZIP válido: {e}")
+
+    try:
+        faltantes = sorted(set(zo.namelist()) - set(zn.namelist()))
+        if faltantes:
+            raise HTTPException(
+                500, f"El archivo generado perdió {len(faltantes)} parte(s) del original: "
+                     f"{faltantes[:5]}")
+
+        # Las macros tienen que salir idénticas byte a byte.
+        if "xl/vbaProject.bin" in zo.namelist():
+            if zo.read("xl/vbaProject.bin") != zn.read("xl/vbaProject.bin"):
+                raise HTTPException(500, "Las macros (vbaProject.bin) cambiaron: se aborta")
+
+        daniado = zn.testzip()
+        if daniado:
+            raise HTTPException(500, f"CRC inválido en el archivo generado: {daniado}")
+    finally:
+        zo.close()
+        zn.close()
+
+    # Última prueba: que abra de verdad y conserve todas sus hojas.
+    try:
+        wb2 = openpyxl.load_workbook(io.BytesIO(nuevo), keep_vba=True, data_only=False)
+    except Exception as e:
+        raise HTTPException(500, f"El archivo generado no se puede abrir: {e}")
+    try:
+        if len(wb2.worksheets) != n_hojas:
+            raise HTTPException(
+                500, f"El archivo generado tiene {len(wb2.worksheets)} hojas "
+                     f"y el original {n_hojas}")
+        find_sheet(wb2)      # lanza si la hoja objetivo desapareció
+    finally:
+        wb2.close()
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "contaser-xlsx", "version": "1.6"}
+    return {"status": "ok", "service": "contaser-xlsx", "version": "1.7"}
 
 
 @app.post("/process")
@@ -345,7 +471,7 @@ async def process(file: UploadFile = File(...), x_service_token: str = Header(de
     ws = find_sheet(wb)
     header_row = find_header_row(ws)
     colmap = map_columns(ws, header_row)
-    anio, nit, nombre = parse_header(ws, header_row)
+    anio, nit, nombre = parse_header(ws, header_row, file.filename)
 
     facturas = []
     last_row = header_row
@@ -435,7 +561,11 @@ async def process(file: UploadFile = File(...), x_service_token: str = Header(de
     ]
 
     # ---- Escritura quirúrgica sobre los bytes ORIGINALES ----
-    nuevo = write_results_table(content, ws.title, last_row, tabla)
+    hoja_titulo = ws.title
+    n_hojas = len(wb.worksheets)
+    nuevo = write_results_table(content, hoja_titulo, last_row, tabla)
+    wb.close()                       # liberar antes de validar (abre otro libro)
+    validar_salida(content, nuevo, n_hojas)
     archivo_b64 = base64.b64encode(nuevo).decode()
 
     return {
@@ -466,7 +596,6 @@ async def process(file: UploadFile = File(...), x_service_token: str = Header(de
 # ---------------------------------------------------------------------------
 
 COLS_TABLA = {3, 4}          # C y D: donde write_results_table escribe
-MARCADOR_TABLA = "RESULTADOS COMPRAS FC ELEC"
 MAX_ITEMS = 200              # tope por lista para no devolver respuestas enormes
 
 # Fórmulas: se buscan directamente y luego se ubica la celda contenedora
@@ -567,7 +696,7 @@ async def audit(file: UploadFile = File(...), x_service_token: str = Header(defa
     ws = find_sheet(wb)
     header_row = find_header_row(ws)
     colmap = map_columns(ws, header_row)
-    anio, nit, nombre = parse_header(ws, header_row)
+    anio, nit, nombre = parse_header(ws, header_row, file.filename)
 
     # --- 1. Volcado del header: diagnostica el nombre de cliente vacío ---
     header_dump = []
@@ -713,7 +842,7 @@ async def audit(file: UploadFile = File(...), x_service_token: str = Header(defa
 
     return {
         "archivo": file.filename,
-        "version_auditoria": "1.6",
+        "version_auditoria": "1.7",
         "hoja_objetivo": hoja_titulo,
         "total_hojas": len(hojas),
         "fila_encabezados": header_row,
