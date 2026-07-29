@@ -18,7 +18,7 @@ from fastapi import FastAPI, UploadFile, File, Header, HTTPException
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.4")
+app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.6")
 
 SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "")  # si está vacío, no exige token
 SHEET_NAME = "COMPRAS FC ELEC"
@@ -73,14 +73,26 @@ def classify_medio(v):
     return "otro"
 
 
+def _norm_title(s):
+    """Normaliza título de hoja: minúsculas, colapsa espacios múltiples."""
+    return re.sub(r"\s+", " ", str(s)).strip().lower() if s is not None else ""
+
+
 def find_sheet(wb):
+    objetivo = _norm_title(SHEET_NAME)
     for ws in wb.worksheets:
-        if _norm(ws.title) == _norm(SHEET_NAME):
+        if _norm_title(ws.title) == objetivo:
             return ws
     for ws in wb.worksheets:
-        if _norm(SHEET_NAME) in _norm(ws.title):
+        if objetivo in _norm_title(ws.title):
             return ws
-    raise HTTPException(400, f"No se encontró la hoja '{SHEET_NAME}'")
+    # variante sin espacios (p.ej. "COMPRASFCELEC")
+    compacto = objetivo.replace(" ", "")
+    for ws in wb.worksheets:
+        if compacto in _norm_title(ws.title).replace(" ", ""):
+            return ws
+    hojas = ", ".join(repr(ws.title) for ws in wb.worksheets)
+    raise HTTPException(400, f"No se encontró la hoja '{SHEET_NAME}'. Hojas del archivo: [{hojas}]")
 
 
 def find_header_row(ws):
@@ -316,7 +328,7 @@ def write_results_table(content: bytes, sheet_title: str, last_row: int,
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "contaser-xlsx", "version": "1.1"}
+    return {"status": "ok", "service": "contaser-xlsx", "version": "1.6"}
 
 
 @app.post("/process")
@@ -446,4 +458,295 @@ async def process(file: UploadFile = File(...), x_service_token: str = Header(de
         "alertas": alertas,
         "facturas": facturas,
         "archivo_modificado_b64": archivo_b64,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Auditoría de riesgos (SOLO LECTURA: no modifica ni devuelve el archivo)
+# ---------------------------------------------------------------------------
+
+COLS_TABLA = {3, 4}          # C y D: donde write_results_table escribe
+MARCADOR_TABLA = "RESULTADOS COMPRAS FC ELEC"
+MAX_ITEMS = 200              # tope por lista para no devolver respuestas enormes
+
+# Fórmulas: se buscan directamente y luego se ubica la celda contenedora
+# mirando hacia atrás. Evita un lookahead por carácter sobre XML de megas.
+_RE_F = re.compile(r"<f[^>]*>(.*?)</f>", re.DOTALL)
+_RE_C_REF = re.compile(r'<c r="([A-Z]+\d+)"')
+
+# Rango con fila explícita: D19, $D$19, D19:H400. El lookahead evita
+# capturar nombres de función (SUM( ) y sufijos alfanuméricos.
+_RE_RANGO = re.compile(
+    r"(?:(?P<hoja>'[^']*'|[A-Za-z_][A-Za-z0-9_.]*)!)?"
+    r"\$?(?P<c1>[A-Z]{1,3})\$?(?P<r1>\d+)"
+    r"(?::\$?(?P<c2>[A-Z]{1,3})\$?(?P<r2>\d+))?"
+    r"(?![A-Za-z0-9_(])")
+
+# Columna completa: D:D, $C:$H  (el caso más peligroso para nuestra tabla)
+_RE_COLFULL = re.compile(
+    r"(?:(?P<hoja>'[^']*'|[A-Za-z_][A-Za-z0-9_.]*)!)?"
+    r"\$?(?P<c1>[A-Z]{1,3})\$?:\$?(?P<c2>[A-Z]{1,3})\$?"
+    r"(?![A-Za-z0-9_(])")
+
+
+def _col_num(letras):
+    n = 0
+    for ch in str(letras).upper():
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - 64)
+    return n
+
+
+def _rango_toca_cd(c1, c2):
+    a = _col_num(c1)
+    b = _col_num(c2) if c2 else a
+    if a > b:
+        a, b = b, a
+    return any(a <= x <= b for x in COLS_TABLA)
+
+
+def _mapa_hojas(z: zipfile.ZipFile):
+    """[(nombre_hoja, ruta_xml), ...] para TODAS las hojas del libro."""
+    wb_xml = z.read("xl/workbook.xml").decode("utf-8", errors="replace")
+    rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8", errors="replace")
+    rel_map = {}
+    for rm in re.finditer(r"<Relationship\b[^>]*/?>", rels):
+        tag = rm.group(0)
+        rid = re.search(r'Id="([^"]*)"', tag)
+        tgt = re.search(r'Target="([^"]*)"', tag)
+        if rid and tgt:
+            t = tgt.group(1)
+            rel_map[rid.group(1)] = t[1:] if t.startswith("/") else "xl/" + t
+    hojas = []
+    for sm in re.finditer(r"<sheet\b[^>]*>", wb_xml):
+        tag = sm.group(0)
+        nm = re.search(r'name="([^"]*)"', tag)
+        rid = re.search(r'r:id="([^"]*)"', tag)
+        if nm and rid and rid.group(1) in rel_map:
+            hojas.append((unescape(nm.group(1)), rel_map[rid.group(1)]))
+    return hojas
+
+
+def _rangos_de(formula, hoja_objetivo, es_hoja_objetivo):
+    """Rangos de la fórmula que apuntan a la hoja objetivo.
+
+    En la propia hoja objetivo, una referencia sin prefijo (D19:D400) apunta
+    a esa hoja: es justo el caso más probable y más peligroso.
+    """
+    f = unescape(formula or "")
+    obj = _norm_title(hoja_objetivo)
+    encontrados = []
+    for rx, tipo in ((_RE_COLFULL, "columna_completa"), (_RE_RANGO, "rango")):
+        for m in rx.finditer(f):
+            hoja = (m.group("hoja") or "").strip("'")
+            propia = (not hoja and es_hoja_objetivo)
+            if not propia and _norm_title(hoja) != obj:
+                continue
+            encontrados.append({
+                "ref": m.group(0),
+                "tipo": tipo,
+                "toca_cd": _rango_toca_cd(m.group("c1"), m.group("c2")),
+            })
+    return encontrados
+
+
+@app.post("/audit")
+async def audit(file: UploadFile = File(...), x_service_token: str = Header(default="")):
+    """Audita el .xlsm SIN modificarlo. Responde si la tabla de resultados
+    puede contaminar fórmulas existentes y vuelca el header para diagnosticar
+    el nombre de cliente vacío."""
+    if SERVICE_TOKEN and x_service_token != SERVICE_TOKEN:
+        raise HTTPException(401, "Token de servicio inválido")
+
+    content = await file.read()
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(content), keep_vba=True, data_only=False)
+    except Exception as e:
+        raise HTTPException(400, f"No se pudo abrir el archivo .xlsm: {e}")
+
+    ws = find_sheet(wb)
+    header_row = find_header_row(ws)
+    colmap = map_columns(ws, header_row)
+    anio, nit, nombre = parse_header(ws, header_row)
+
+    # --- 1. Volcado del header: diagnostica el nombre de cliente vacío ---
+    header_dump = []
+    for r in range(1, header_row):
+        celdas = {}
+        for c in range(1, 9):
+            v = ws.cell(row=r, column=c).value
+            if v is not None and str(v).strip() != "":
+                celdas[get_column_letter(c)] = str(v)[:120]
+        if celdas:
+            header_dump.append({"fila": r, "celdas": celdas})
+
+    # --- 2. ¿Alguna columna de datos vive en C o D? ---
+    columnas_datos = {campo: get_column_letter(c)
+                      for campo, c in sorted(colmap.items(), key=lambda kv: kv[1])}
+    conflicto_cd = sorted({v for v in columnas_datos.values()} & {"C", "D"})
+
+    # --- 3. Extensión real de los datos (misma lógica que /process) ---
+    last_row = header_row
+    r = header_row + 1
+    while r < header_row + 100000:
+        nit_em = ws.cell(row=r, column=colmap["nit_emisor"]).value
+        if END_MARKER in _norm(nit_em):
+            break
+        claves = [ws.cell(row=r, column=colmap[k]).value
+                  for k in ("nit_emisor", "valor_facturado", "cufe")]
+        if all(v is None or str(v).strip() == "" for v in claves):
+            break
+        last_row = r
+        r += 1
+
+    # --- 4. Qué hay hoy en las columnas C y D ---
+    filas_muestra = sorted({x for x in (
+        list(range(1, header_row + 1))
+        + [header_row + 1, header_row + 2, last_row, last_row + 1, last_row + 2]
+    ) if x >= 1})
+    contenido_cd = []
+    for r in filas_muestra:
+        cv = ws.cell(row=r, column=3).value
+        dv = ws.cell(row=r, column=4).value
+        if cv is None and dv is None:
+            continue
+        contenido_cd.append({
+            "fila": r,
+            "C": str(cv)[:120] if cv is not None else None,
+            "D": str(dv)[:120] if dv is not None else None,
+        })
+
+    # openpyxl ya no se necesita: liberar el libro antes del barrido del ZIP
+    # (un .xlsm de 11 MB ocupa cientos de MB cargado en memoria).
+    hoja_titulo = ws.title
+    wb.close()
+
+    zin = zipfile.ZipFile(io.BytesIO(content))
+    hojas = _mapa_hojas(zin)
+    obj_norm = _norm_title(hoja_titulo)
+
+    # --- 5. Barrido de fórmulas en todas las hojas ---
+    formulas_riesgo, formulas_referencian = [], []
+    total_formulas = 0
+    for nombre_hoja, ruta in hojas:
+        try:
+            sxml = zin.read(ruta).decode("utf-8", errors="replace")
+        except KeyError:
+            continue
+        es_obj = _norm_title(nombre_hoja) == obj_norm
+        for m in _RE_F.finditer(sxml):
+            formula = m.group(1)
+            if not formula.strip():
+                continue
+            total_formulas += 1
+            # Celda contenedora = <c r="..."> más cercano hacia atrás
+            celda = ""
+            i = sxml.rfind('<c r="', 0, m.start())
+            if i != -1:
+                cm = _RE_C_REF.match(sxml, i)
+                if cm:
+                    celda = cm.group(1)
+            rel = _rangos_de(formula, hoja_titulo, es_obj)
+            if not rel:
+                continue
+            peligrosos = [rg["ref"] for rg in rel if rg["toca_cd"]]
+            item = {
+                "hoja": nombre_hoja,
+                "celda": celda,
+                "formula": unescape(formula)[:300],
+                "rangos_sobre_hoja_objetivo": [rg["ref"] for rg in rel][:20],
+                "rangos_que_tocan_C_o_D": peligrosos[:20],
+            }
+            if len(formulas_referencian) < MAX_ITEMS:
+                formulas_referencian.append(item)
+            if peligrosos and len(formulas_riesgo) < MAX_ITEMS:
+                formulas_riesgo.append(item)
+
+    # --- 6. Nombres definidos que apunten a la hoja ---
+    wb_xml = zin.read("xl/workbook.xml").decode("utf-8", errors="replace")
+    nombres_definidos = []
+    for m in re.finditer(r"<definedName\b([^>]*)>(.*?)</definedName>", wb_xml, re.DOTALL):
+        nm = re.search(r'name="([^"]*)"', m.group(1))
+        crudo = m.group(2)          # _rangos_de hace su propio unescape
+        rel = _rangos_de(crudo, hoja_titulo, False)
+        if rel:
+            nombres_definidos.append({
+                "nombre": nm.group(1) if nm else "",
+                "refiere_a": unescape(crudo)[:300],
+                "toca_C_o_D": any(rg["toca_cd"] for rg in rel),
+            })
+
+    # --- 7. Rastro de tablas anteriores (idempotencia) ---
+    marcador = []
+    for nombre_hoja, ruta in hojas:
+        try:
+            sxml = zin.read(ruta).decode("utf-8", errors="replace")
+        except KeyError:
+            continue
+        if MARCADOR_TABLA not in sxml:
+            continue
+        for mm in re.finditer(r'<row r="(\d+)"[^>]*?(?:/>|>.*?</row>)', sxml, re.DOTALL):
+            if MARCADOR_TABLA in mm.group(0):
+                marcador.append({"hoja": nombre_hoja, "fila": int(mm.group(1))})
+
+    # Si Excel reguardó el archivo, el texto pudo migrar a sharedStrings y la
+    # idempotencia de write_results_table dejaría de encontrarlo -> tabla doble.
+    marcador_shared = False
+    try:
+        ss = zin.read("xl/sharedStrings.xml").decode("utf-8", errors="replace")
+        marcador_shared = MARCADOR_TABLA in ss
+    except KeyError:
+        pass
+
+    # --- 8. Dónde caería la tabla ---
+    sheet_path = _sheet_xml_path(zin, hoja_titulo)
+    sxml_obj = zin.read(sheet_path).decode("utf-8", errors="replace")
+    existentes = [int(x) for x in re.findall(r'<row r="(\d+)"', sxml_obj)]
+    max_existente = max(existentes) if existentes else last_row
+    start = max(last_row + 3, max_existente + 2)
+
+    zin.close()
+
+    n_riesgo = len(formulas_riesgo)
+    hay_riesgo = bool(n_riesgo or conflicto_cd
+                      or any(n["toca_C_o_D"] for n in nombres_definidos))
+
+    return {
+        "archivo": file.filename,
+        "version_auditoria": "1.6",
+        "hoja_objetivo": hoja_titulo,
+        "total_hojas": len(hojas),
+        "fila_encabezados": header_row,
+        "ultima_fila_datos": last_row,
+        "total_facturas": max(0, last_row - header_row),
+        "header_parseado": {
+            "anio_gravable": str(anio) if anio is not None else None,
+            "nit": str(nit).strip() if nit else "",
+            "nombre": str(nombre).strip() if nombre else "",
+            "nombre_vacio": not (nombre and str(nombre).strip()),
+        },
+        "header_dump": header_dump,
+        "columnas_datos": columnas_datos,
+        "columnas_datos_en_C_o_D": conflicto_cd,
+        "contenido_actual_C_D": contenido_cd,
+        "zona_escritura": {
+            "fila_inicio_tabla": start,
+            "filas_que_ocupa": 7,
+            "columnas": ["C", "D"],
+            "max_fila_existente": max_existente,
+        },
+        "formulas_que_tocan_C_o_D": formulas_riesgo,
+        "formulas_que_referencian_la_hoja": formulas_referencian,
+        "nombres_definidos": nombres_definidos,
+        "tabla_previa_detectada": marcador,
+        "marcador_en_sharedStrings": marcador_shared,
+        "resumen": {
+            "total_formulas_del_libro": total_formulas,
+            "formulas_que_referencian_la_hoja": len(formulas_referencian),
+            "formulas_en_riesgo": n_riesgo,
+            "columnas_de_datos_invadidas": conflicto_cd,
+            "listas_truncadas": (len(formulas_referencian) >= MAX_ITEMS
+                                 or n_riesgo >= MAX_ITEMS),
+            "veredicto": "RIESGO DETECTADO" if hay_riesgo else "SIN RIESGO DETECTADO",
+        },
     }
