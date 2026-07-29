@@ -15,11 +15,11 @@ import zipfile
 from datetime import datetime, date
 from xml.sax.saxutils import escape, unescape
 
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.7")
+app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.8")
 
 SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "")  # si está vacío, no exige token
 SHEET_NAME = "COMPRAS FC ELEC"
@@ -126,9 +126,15 @@ def find_sheet(wb):
     raise HTTPException(400, f"No se encontró la hoja '{SHEET_NAME}'. Hojas del archivo: [{hojas}]")
 
 
+# Márgenes de barrido. Las columnas de la DIAN pueden correrse de posición si
+# se agregan columnas nuevas; los nombres no cambian, pero la posición sí.
+MAX_FILA_HEADER = 80      # hasta dónde se busca la fila de encabezados
+MAX_COL_HEADER = 40       # hasta qué columna se buscan las etiquetas
+
+
 def find_header_row(ws):
-    for r in range(1, 60):
-        for c in range(1, 20):
+    for r in range(1, MAX_FILA_HEADER):
+        for c in range(1, MAX_COL_HEADER):
             if _norm(ws.cell(row=r, column=c).value) == "identificación emisor factura":
                 return r
     raise HTTPException(400, "No se encontró la fila de encabezados de datos (COMPRAS FC ELEC)")
@@ -136,8 +142,13 @@ def find_header_row(ws):
 
 def map_columns(ws, header_row):
     colmap = {}
-    for c in range(1, 25):
-        label = _norm(ws.cell(row=header_row, column=c).value)
+    encontradas = []
+    for c in range(1, MAX_COL_HEADER + 1):
+        crudo = ws.cell(row=header_row, column=c).value
+        label = _norm(crudo)
+        if not label:
+            continue
+        encontradas.append(f"{get_column_letter(c)}={crudo}")
         if label.startswith("cufe"):
             colmap["cufe"] = c
         elif label in COL_LABELS:
@@ -145,8 +156,21 @@ def map_columns(ws, header_row):
     requeridas = ["nit_emisor", "valor_facturado", "valor_neto", "valor_beneficio", "medio_pago", "cufe"]
     faltan = [k for k in requeridas if k not in colmap]
     if faltan:
-        raise HTTPException(400, f"Faltan columnas en el encabezado: {faltan}")
+        # Incluir los encabezados reales: sin esto el diagnóstico es a ciegas.
+        raise HTTPException(
+            400, f"Faltan columnas en el encabezado: {faltan}. "
+                 f"Encabezados encontrados en la fila {header_row}: {encontradas[:25]}")
     return colmap
+
+
+def _celda(ws, fila, colmap, campo):
+    """Valor de una columna mapeada, o None si esa columna no existe.
+
+    Solo 6 de las 11 columnas son obligatorias; sin esto, un archivo sin
+    'Valor Notas Crédito' reventaba con KeyError y un 500 sin explicación.
+    """
+    c = colmap.get(campo)
+    return ws.cell(row=fila, column=c).value if c else None
 
 
 def parse_header(ws, header_row, nombre_archivo=None):
@@ -454,7 +478,7 @@ def validar_salida(original: bytes, nuevo: bytes, n_hojas: int):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "contaser-xlsx", "version": "1.7"}
+    return {"status": "ok", "service": "contaser-xlsx", "version": "1.8"}
 
 
 @app.post("/process")
@@ -485,16 +509,16 @@ async def process(file: UploadFile = File(...), x_service_token: str = Header(de
             break
         facturas.append({
             "nit_emisor": str(nit_em).strip() if nit_em is not None else "",
-            "nombre_emisor": str(ws.cell(row=r, column=colmap["nombre_emisor"]).value or "").strip(),
-            "fecha_emision": to_iso(ws.cell(row=r, column=colmap["fecha_emision"]).value),
-            "valor_facturado": to_number(ws.cell(row=r, column=colmap["valor_facturado"]).value),
-            "notas_credito": to_number(ws.cell(row=r, column=colmap["notas_credito"]).value),
-            "notas_debito": to_number(ws.cell(row=r, column=colmap["notas_debito"]).value),
-            "valor_neto": to_number(ws.cell(row=r, column=colmap["valor_neto"]).value),
-            "valor_beneficio": to_number(ws.cell(row=r, column=colmap["valor_beneficio"]).value),
-            "medio_pago": str(ws.cell(row=r, column=colmap["medio_pago"]).value or "").strip(),
-            "num_factura": str(ws.cell(row=r, column=colmap["num_factura"]).value or "").strip(),
-            "cufe": str(ws.cell(row=r, column=colmap["cufe"]).value or "").strip(),
+            "nombre_emisor": str(_celda(ws, r, colmap, "nombre_emisor") or "").strip(),
+            "fecha_emision": to_iso(_celda(ws, r, colmap, "fecha_emision")),
+            "valor_facturado": to_number(_celda(ws, r, colmap, "valor_facturado")),
+            "notas_credito": to_number(_celda(ws, r, colmap, "notas_credito")),
+            "notas_debito": to_number(_celda(ws, r, colmap, "notas_debito")),
+            "valor_neto": to_number(_celda(ws, r, colmap, "valor_neto")),
+            "valor_beneficio": to_number(_celda(ws, r, colmap, "valor_beneficio")),
+            "medio_pago": str(_celda(ws, r, colmap, "medio_pago") or "").strip(),
+            "num_factura": str(_celda(ws, r, colmap, "num_factura") or "").strip(),
+            "cufe": str(_celda(ws, r, colmap, "cufe") or "").strip(),
         })
         last_row = r
         r += 1
@@ -842,7 +866,7 @@ async def audit(file: UploadFile = File(...), x_service_token: str = Header(defa
 
     return {
         "archivo": file.filename,
-        "version_auditoria": "1.7",
+        "version_auditoria": "1.8",
         "hoja_objetivo": hoja_titulo,
         "total_hojas": len(hojas),
         "fila_encabezados": header_row,
@@ -879,3 +903,84 @@ async def audit(file: UploadFile = File(...), x_service_token: str = Header(defa
             "veredicto": "RIESGO DETECTADO" if hay_riesgo else "SIN RIESGO DETECTADO",
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Inspección genérica de hojas (SOLO LECTURA)
+# ---------------------------------------------------------------------------
+
+def _buscar_hoja(wb, nombre):
+    """Localiza una hoja por nombre con tolerancia (igual que find_sheet,
+    pero para cualquier hoja, no solo COMPRAS FC ELEC)."""
+    objetivo = _norm_title(nombre)
+    for w in wb.worksheets:
+        if _norm_title(w.title) == objetivo:
+            return w
+    for w in wb.worksheets:
+        if objetivo and objetivo in _norm_title(w.title):
+            return w
+    compacto = objetivo.replace(" ", "")
+    for w in wb.worksheets:
+        if compacto and compacto in _norm_title(w.title).replace(" ", ""):
+            return w
+    return None
+
+
+@app.post("/inspect")
+async def inspect(file: UploadFile = File(...),
+                  hoja: str = Form(default=""),
+                  filas: int = Form(default=25),
+                  x_service_token: str = Header(default="")):
+    """Devuelve la estructura de una hoja SIN modificar el archivo.
+
+    Sirve para diseñar los módulos siguientes (REPORTE DIAN, PATRIMONIO,
+    CED.1 GENERAL...) sobre datos reales en vez de suposiciones. Si no se
+    indica `hoja`, lista todas las hojas del libro con sus dimensiones.
+    """
+    if SERVICE_TOKEN and x_service_token != SERVICE_TOKEN:
+        raise HTTPException(401, "Token de servicio inválido")
+
+    content = await file.read()
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(content), keep_vba=True, data_only=False)
+    except Exception as e:
+        raise HTTPException(400, f"No se pudo abrir el archivo .xlsm: {e}")
+
+    hojas = [{"nombre": w.title, "max_fila": w.max_row, "max_columna": w.max_column}
+             for w in wb.worksheets]
+
+    if not (hoja or "").strip():
+        wb.close()
+        return {"archivo": file.filename, "total_hojas": len(hojas), "hojas": hojas}
+
+    ws = _buscar_hoja(wb, hoja)
+    if ws is None:
+        nombres = [h["nombre"] for h in hojas]
+        wb.close()
+        raise HTTPException(400, f"No se encontró la hoja {hoja!r}. Hojas del libro: {nombres}")
+
+    tope_filas = max(1, min(int(filas or 25), 200))
+    max_col = min(ws.max_column or 1, MAX_COL_HEADER)
+    muestra = []
+    for r in range(1, min(ws.max_row or 1, 2000) + 1):
+        celdas = {}
+        for c in range(1, max_col + 1):
+            v = ws.cell(row=r, column=c).value
+            if v is not None and str(v).strip() != "":
+                celdas[get_column_letter(c)] = str(v)[:120]
+        if celdas:
+            muestra.append({"fila": r, "celdas": celdas})
+            if len(muestra) >= tope_filas:
+                break
+
+    resultado = {
+        "archivo": file.filename,
+        "hoja": ws.title,
+        "dimensiones": {"max_fila": ws.max_row, "max_columna": ws.max_column,
+                        "ultima_columna_letra": get_column_letter(ws.max_column or 1)},
+        "filas_mostradas": len(muestra),
+        "muestra": muestra,
+        "hojas_del_libro": [h["nombre"] for h in hojas],
+    }
+    wb.close()
+    return resultado

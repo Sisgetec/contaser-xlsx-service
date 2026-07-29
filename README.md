@@ -12,6 +12,8 @@ resultados junto con el `.xlsm` modificado (en base64).
   Header opcional `X-Service-Token` si se define la variable `SERVICE_TOKEN`.
 - `POST /audit` → **solo lectura**: audita el .xlsm sin modificarlo ni devolverlo.
   Mismo formato de entrada y mismo token que `/process`.
+- `POST /inspect` → **solo lectura**: estructura de una hoja cualquiera.
+  Campos: `file`, `hoja` (opcional), `filas` (opcional). Sin `hoja` lista todas.
 
 ### `/audit` — para qué sirve
 Responde con datos (no con teoría) dos preguntas abiertas del proyecto:
@@ -42,6 +44,30 @@ Campos clave de la respuesta:
 Limitaciones conocidas: la detección de rangos es heurística (regex sobre el XML),
 no evalúa fórmulas indirectas (`INDIRECTO`, `DESREF`) ni referencias generadas por
 macros VBA. Las listas se truncan a 200 elementos (`resumen.listas_truncadas`).
+
+## Cambios de la v1.8
+
+Blindaje ante columnas corridas y un endpoint de inspección.
+
+1. **Barrido más amplio.** Los nombres de las columnas que entrega la DIAN no
+   cambian, pero su **posición sí** puede correrse si se agregan columnas.
+   `find_header_row` y `map_columns` ahora recorren hasta la fila 80 y la
+   columna 40 (antes 60 y 24). Con el CUFE en la columna L, el margen pasa de
+   12 a 28 columnas nuevas.
+2. **Error de columnas faltantes con diagnóstico.** El 400 ahora incluye los
+   encabezados **reales** que encontró en la fila, con su letra de columna. Antes
+   solo decía qué faltaba, sin pistas de qué había en su lugar.
+3. **Columnas opcionales sin `KeyError`.** Solo 6 de las 11 columnas son
+   obligatorias, pero el código leía las 11. Si faltaba `Valor Notas Crédito`
+   o `num_factura_venta`, reventaba con un 500 sin explicación. Ahora el helper
+   `_celda` devuelve `None` y los valores caen a 0 o cadena vacía.
+4. **Nuevo `POST /inspect`** (solo lectura). Devuelve la estructura de cualquier
+   hoja: encabezados reales, filas de muestra y dimensiones. Sin `hoja`, lista
+   todas las hojas del libro. Pensado para diseñar los módulos siguientes
+   (REPORTE DIAN, PATRIMONIO, CED.1 GENERAL) sobre datos reales.
+
+   Campos del formulario: `file` (el .xlsm), `hoja` (opcional), `filas`
+   (opcional, por defecto 25, máximo 200).
 
 ## Cambios de la v1.7
 
