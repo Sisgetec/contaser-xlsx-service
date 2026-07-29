@@ -14,6 +14,7 @@ resultados junto con el `.xlsm` modificado (en base64).
   Mismo formato de entrada y mismo token que `/process`.
 - `POST /inspect` → **solo lectura**: estructura de una hoja cualquiera.
   Campos: `file`, `hoja` (opcional), `filas` (opcional). Sin `hoja` lista todas.
+- `POST /dian-preview` → **solo lectura**: resultado del Módulo 2 sin escribir.
 
 ### `/audit` — para qué sirve
 Responde con datos (no con teoría) dos preguntas abiertas del proyecto:
@@ -44,6 +45,66 @@ Campos clave de la respuesta:
 Limitaciones conocidas: la detección de rangos es heurística (regex sobre el XML),
 no evalúa fórmulas indirectas (`INDIRECTO`, `DESREF`) ni referencias generadas por
 macros VBA. Las listas se truncan a 200 elementos (`resumen.listas_truncadas`).
+
+## Cambios de la v1.9 — Módulo 2: comparación REPORTE DIAN
+
+`/process` ahora corre **dos módulos en una sola pasada** y escribe el archivo
+**una sola vez**. El flujo de n8n no cambia.
+
+```
+descarga → /process ─┬─ Módulo 1: COMPRAS FC ELEC   (siempre)
+                     └─ Módulo 2: REPORTE DIAN      (si hay 2+ hojas)
+                     → un archivo de salida → una escritura en Drive
+```
+
+**Cómo identifica las hojas.** Toma todas las hojas cuyo nombre empiece por
+`REPORTE DIAN` y que tengan estructura de reporte, y las ordena por la **fecha
+de reporte interna** (fila 2 de cada hoja), no por el nombre:
+
+- **base** = la fecha más antigua → es la que Contaser ya trabajó
+- **nueva** = la fecha más reciente → el export recién llegado
+
+Así funciona con `REPORTE DIAN ULTIMO`, `REPORTE DIAN 19 AGOST`, `SEPT 3` o
+cualquier convención que use el equipo.
+
+**Por qué no se comparan los textos.** La hoja base está **anotada por
+Contaser**: trae los cinco `Tope N`, textos de `Uso declaración` más largos y
+dos columnas extra del consultante que la hoja nueva no tiene. Comparar textos
+marcaría esas anotaciones como diferencias. El emparejamiento va en tres pasadas:
+
+| Pasada | Criterio | Resultado |
+|---|---|---|
+| 1 | `NIT + Valor` exacto | sin cambio |
+| 2 | `NIT + prefijo del Detalle` normalizado | **valor cambiado** |
+| 3 | lo que sobra | solo en la nueva → **nuevo**; solo en la base → **desaparecido** |
+
+**Mapeo de columnas: gana la primera aparición.** La hoja base repite `NIT` y
+`Nombre / Razón Social` (una vez para el tercero que reporta y otra para el
+consultante). Sin esta regla se compararía el NIT del cliente contra sí mismo.
+Las filas sin NIT se descartan: ahí caen los `Tope N`.
+
+**El cuadro que escribe**, al final de la hoja nueva, en las columnas B a F:
+
+1. Resumen — conteos y valores de cada categoría, más totales de ambas hojas
+2. **Impacto en la declaración** — agrupa lo nuevo y lo cambiado por código de
+   renglón (`R29`, `R74`, `R99`…) y por `Tope N`, extraídos de la columna
+   `Uso declaración Sugerida`. Renglones y topes se listan **separados**: un
+   registro puede afectar a ambos y sumarlos daría un total engañoso
+3. Detalle de los registros nuevos, los cambiados (con su valor anterior) y los
+   desaparecidos
+
+**Idempotente**, con la misma detección de `sharedStrings` de la v1.7. ⚠️ Al
+reescribir se borra **todo lo que haya desde la fila del marcador hacia abajo**;
+el cuadro va siempre al final, así que no escribas notas manuales debajo.
+
+**Nuevo `POST /dian-preview`** (solo lectura): corre el Módulo 2 y devuelve el
+resultado **sin escribir nada**. Sirve para validar la comparación antes de
+dejarla tocar un archivo.
+
+**Limitación conocida:** si un mismo tercero reporta dos conceptos con el
+**mismo valor exacto**, el emparejamiento es ambiguo. Esos casos se emparejan
+igual pero se listan en `ambiguos` para revisión manual, en vez de adivinar en
+silencio.
 
 ## Cambios de la v1.8
 

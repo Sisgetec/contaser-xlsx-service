@@ -19,7 +19,7 @@ from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.8")
+app = FastAPI(title="Contaser - COMPRAS FC ELEC", version="1.9")
 
 SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "")  # si está vacío, no exige token
 SHEET_NAME = "COMPRAS FC ELEC"
@@ -478,7 +478,8 @@ def validar_salida(original: bytes, nuevo: bytes, n_hojas: int):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "contaser-xlsx", "version": "1.8"}
+    return {"status": "ok", "service": "contaser-xlsx", "version": "1.9",
+            "modulos": ["COMPRAS FC ELEC", "REPORTE DIAN"]}
 
 
 @app.post("/process")
@@ -584,10 +585,17 @@ async def process(file: UploadFile = File(...), x_service_token: str = Header(de
          round(benef_elec / base_fact_nc, 4) if base_fact_nc else 0, "pct"),
     ]
 
+    # ---- Módulo 2: comparación REPORTE DIAN (None si el libro no aplica) ----
+    dian = procesar_modulo_dian(wb)
+
     # ---- Escritura quirúrgica sobre los bytes ORIGINALES ----
+    # Los dos módulos escriben en la misma pasada de bytes: la salida del
+    # Módulo 1 entra al Módulo 2, y Drive se actualiza UNA sola vez.
     hoja_titulo = ws.title
     n_hojas = len(wb.worksheets)
     nuevo = write_results_table(content, hoja_titulo, last_row, tabla)
+    if dian:
+        nuevo = write_dian_table(nuevo, dian["hoja_nueva"], dian.pop("_filas"))
     wb.close()                       # liberar antes de validar (abre otro libro)
     validar_salida(content, nuevo, n_hojas)
     archivo_b64 = base64.b64encode(nuevo).decode()
@@ -610,6 +618,7 @@ async def process(file: UploadFile = File(...), x_service_token: str = Header(de
         "medios": medios,
         "pct_real": {"electronico": pct_elec, "efectivo": pct_efec},
         "alertas": alertas,
+        "reporte_dian": dian,        # None si el libro no trae dos hojas REPORTE DIAN
         "facturas": facturas,
         "archivo_modificado_b64": archivo_b64,
     }
@@ -903,6 +912,415 @@ async def audit(file: UploadFile = File(...), x_service_token: str = Header(defa
             "veredicto": "RIESGO DETECTADO" if hay_riesgo else "SIN RIESGO DETECTADO",
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# MÓDULO 2 — Comparación REPORTE DIAN
+# ---------------------------------------------------------------------------
+# La hoja base es la que Contaser YA trabajó: trae anotaciones propias (los
+# cinco 'Tope N', textos de 'Uso declaración' más largos y dos columnas extra
+# del consultante). La hoja nueva es un export crudo. Por eso las diferencias
+# de TEXTO son ruido y el emparejamiento se hace por NIT + Valor.
+
+DIAN_PREFIJO = "reporte dian"
+# Sin tildes a propósito: este texto es además el marcador de idempotencia y
+# se busca dentro del XML, así que conviene mantenerlo lo más simple posible.
+MARCADOR_DIAN = "COMPARACION REPORTE DIAN"
+
+_RE_RENGLON = re.compile(r"\bR\s?(\d{1,3})\b")
+_RE_TOPE = re.compile(r"\btope\s*(\d)\b", re.I)
+
+
+def _clave_fecha(s):
+    """Clave ordenable a partir de una fecha ('2025-08-19 09:12:51' -> '20250819091251')."""
+    return re.sub(r"[^0-9]", "", str(s or ""))[:14].ljust(14, "0")
+
+
+def _header_row_dian(ws):
+    """Fila de encabezados: la única que trae NIT, Detalle y Valor a la vez."""
+    for r in range(1, MAX_FILA_HEADER):
+        etiquetas = {_norm_label(ws.cell(row=r, column=c).value)
+                     for c in range(1, MAX_COL_HEADER + 1)}
+        if {"nit", "detalle", "valor"} <= etiquetas:
+            return r
+    raise HTTPException(400, "REPORTE DIAN: no se encontró la fila de encabezados "
+                             "(se esperaban NIT, Detalle y Valor en la misma fila)")
+
+
+def _fecha_reporte_dian(ws, header_row):
+    """'Fecha Reporte' del bloque superior de la hoja."""
+    for r in range(1, header_row):
+        for c in range(1, MAX_COL_HEADER + 1):
+            if _norm_label(ws.cell(row=r, column=c).value).startswith("fecha reporte"):
+                for cc in range(c + 1, MAX_COL_HEADER + 1):
+                    v = ws.cell(row=r, column=cc).value
+                    if v is not None and str(v).strip():
+                        return v.isoformat() if isinstance(v, (datetime, date)) else str(v).strip()
+    return ""
+
+
+def _map_columns_dian(ws, header_row):
+    """Mapea las columnas por etiqueta. GANA LA PRIMERA APARICIÓN: la hoja
+    base repite 'NIT' y 'Nombre' para el consultante y no queremos esas."""
+    colmap = {}
+    encontradas = []
+    for c in range(1, MAX_COL_HEADER + 1):
+        crudo = ws.cell(row=header_row, column=c).value
+        lab = _norm_label(crudo)
+        if not lab:
+            continue
+        encontradas.append(f"{get_column_letter(c)}={crudo}")
+        if lab == "nit":
+            colmap.setdefault("nit", c)
+        elif lab.startswith("nombre"):
+            colmap.setdefault("tercero", c)
+        elif lab == "detalle":
+            colmap.setdefault("detalle", c)
+        elif lab == "valor":
+            colmap.setdefault("valor", c)
+        elif lab.startswith("uso declaracion"):
+            colmap.setdefault("uso", c)
+        elif lab.startswith("informacion adicional"):
+            colmap.setdefault("info", c)
+    faltan = [k for k in ("nit", "detalle", "valor") if k not in colmap]
+    if faltan:
+        raise HTTPException(400, f"REPORTE DIAN ({ws.title}): faltan columnas {faltan}. "
+                                 f"Encabezados en la fila {header_row}: {encontradas[:20]}")
+    return colmap
+
+
+def _fila_marcador(ws, marcador):
+    """Fila donde empieza un cuadro escrito por nosotros, o None."""
+    for r in range(1, (ws.max_row or 1) + 1):
+        for c in range(1, 10):
+            v = ws.cell(row=r, column=c).value
+            if v is not None and marcador in str(v):
+                return r
+    return None
+
+
+def _leer_registros_dian(ws, header_row, colmap):
+    """Registros de la hoja. Descarta filas sin NIT (ahí caen los 'Tope N')
+    y se detiene antes de un cuadro de comparación previo, para no leer
+    nuestra propia salida como si fueran registros de la DIAN."""
+    tope = _fila_marcador(ws, MARCADOR_DIAN) or ((ws.max_row or header_row) + 1)
+    registros = []
+    for r in range(header_row + 1, tope):
+        nit = _celda(ws, r, colmap, "nit")
+        nit_s = str(nit).strip() if nit is not None else ""
+        if not nit_s:
+            continue
+        registros.append({
+            "nit": nit_s,
+            "tercero": str(_celda(ws, r, colmap, "tercero") or "").strip(),
+            "detalle": str(_celda(ws, r, colmap, "detalle") or "").strip(),
+            "valor": to_number(_celda(ws, r, colmap, "valor")),
+            "uso": str(_celda(ws, r, colmap, "uso") or "").strip(),
+            "fila": r,
+        })
+    return registros
+
+
+def _pref(s):
+    return _norm_label(s)[:40]
+
+
+def comparar_registros_dian(base, nueva):
+    """Reconciliación en tres pasadas. Devuelve (sin_cambio, cambiados,
+    nuevos, desaparecidos, ambiguos)."""
+    usados = set()
+    sin_cambio, cambiados, nuevos, ambiguos = [], [], [], []
+
+    # Pasada 1 — NIT + Valor exacto: el registro no cambió.
+    idx1 = {}
+    for i, reg in enumerate(base):
+        idx1.setdefault((reg["nit"], round(reg["valor"], 2)), []).append(i)
+    resto_nueva = []
+    for reg in nueva:
+        libres = [i for i in idx1.get((reg["nit"], round(reg["valor"], 2)), [])
+                  if i not in usados]
+        if libres:
+            usados.add(libres[0])
+            sin_cambio.append(reg)
+            if len(libres) > 1:
+                ambiguos.append({**reg, "motivo": "varios registros del mismo NIT con igual valor"})
+        else:
+            resto_nueva.append(reg)
+
+    # Pasada 2 — NIT + prefijo del Detalle: cambió el valor.
+    for reg in resto_nueva:
+        p = _pref(reg["detalle"])
+        elegido = None
+        for i, b in enumerate(base):
+            if i in usados or b["nit"] != reg["nit"]:
+                continue
+            pb = _pref(b["detalle"])
+            if pb == p or pb.startswith(p) or p.startswith(pb):
+                elegido = i
+                break
+        if elegido is None:
+            nuevos.append(reg)
+        else:
+            usados.add(elegido)
+            ant = base[elegido]["valor"]
+            cambiados.append({**reg, "valor_anterior": ant,
+                              "diferencia": round(reg["valor"] - ant, 2)})
+
+    # Pasada 3 — lo que quedó sin emparejar en la base desapareció.
+    desaparecidos = [b for i, b in enumerate(base) if i not in usados]
+    return sin_cambio, cambiados, nuevos, desaparecidos, ambiguos
+
+
+def impacto_dian(nuevos, cambiados):
+    """Agrupa el impacto por renglón de la declaración (R29, R74...) y por
+    Tope. Se mantienen separados a propósito: un mismo registro puede afectar
+    un renglón y un tope, y sumarlos juntos daría un total engañoso."""
+    renglones, topes, sin_clasificar = {}, {}, {"valor": 0.0, "registros": 0}
+
+    def sumar(acum, clave, descripcion, monto):
+        e = acum.setdefault(clave, {"codigo": clave, "descripcion": descripcion,
+                                    "valor": 0.0, "registros": 0})
+        e["valor"] += monto
+        e["registros"] += 1
+
+    for reg, monto in ([(r, r["valor"]) for r in nuevos]
+                       + [(r, r["diferencia"]) for r in cambiados]):
+        uso = reg.get("uso") or ""
+        clasificado = False
+        for m in _RE_RENGLON.finditer(uso):
+            desc = uso[m.end():].split("|")[0].strip(" -–|") or uso[:60]
+            sumar(renglones, "R" + m.group(1), desc[:60], monto)
+            clasificado = True
+        for m in _RE_TOPE.finditer(uso):
+            sumar(topes, "Tope " + m.group(1), uso[m.end():].split("|")[0].strip(" .-–|")[:60], monto)
+            clasificado = True
+        if not clasificado:
+            sin_clasificar["valor"] += monto
+            sin_clasificar["registros"] += 1
+
+    orden = lambda d: sorted(d.values(), key=lambda e: -abs(e["valor"]))
+    return {"renglones": orden(renglones), "topes": orden(topes),
+            "sin_clasificar": sin_clasificar}
+
+
+def construir_cuadro_dian(base_m, nueva_m, sin_cambio, cambiados, nuevos,
+                          desaparecidos, impacto):
+    """Arma las filas del cuadro. Cada celda es (columna, valor, estilo)."""
+    B, C, D, E, F = "B", "C", "D", "E", "F"
+    filas = []
+    suma = lambda regs: int(round(sum(r["valor"] for r in regs)))
+
+    filas.append([(B, MARCADOR_DIAN, "titulo"), (C, "", "titulo"),
+                  (D, "", "titulo"), (E, "", "titulo"), (F, "", "titulo")])
+    filas.append([(B, "Hoja base (ya trabajada)", "label"),
+                  (C, f"{base_m['hoja']}  |  {base_m['fecha']}", None)])
+    filas.append([(B, "Hoja nueva", "label"),
+                  (C, f"{nueva_m['hoja']}  |  {nueva_m['fecha']}", None)])
+    filas.append([])
+
+    filas.append([(B, "Concepto", "header"), (C, "Cantidad", "header"),
+                  (D, "Valor", "header")])
+    filas.append([(B, "Registros sin cambio", "label"),
+                  (C, len(sin_cambio), "money"), (D, suma(sin_cambio), "money")])
+    filas.append([(B, "Registros NUEVOS", "label"),
+                  (C, len(nuevos), "money"), (D, suma(nuevos), "money")])
+    filas.append([(B, "Registros con VALOR CAMBIADO", "label"),
+                  (C, len(cambiados), "money"),
+                  (D, int(round(sum(r["diferencia"] for r in cambiados))), "money")])
+    filas.append([(B, "Registros DESAPARECIDOS", "label"),
+                  (C, len(desaparecidos), "money"), (D, suma(desaparecidos), "money")])
+    filas.append([(B, "Total hoja base", "label"),
+                  (C, len(sin_cambio) + len(cambiados) + len(desaparecidos), "money"),
+                  (D, suma(sin_cambio) + suma(desaparecidos)
+                      + int(round(sum(r["valor_anterior"] for r in cambiados))), "money")])
+    filas.append([(B, "Total hoja nueva", "label"),
+                  (C, len(sin_cambio) + len(cambiados) + len(nuevos), "money"),
+                  (D, suma(sin_cambio) + suma(cambiados) + suma(nuevos), "money")])
+    filas.append([])
+
+    if impacto["renglones"] or impacto["topes"]:
+        filas.append([(B, "IMPACTO EN LA DECLARACION (solo nuevos y cambiados)", "titulo"),
+                      (C, "", "titulo"), (D, "", "titulo"), (E, "", "titulo"), (F, "", "titulo")])
+        filas.append([(B, "Renglon / Tope", "header"), (C, "Descripcion", "header"),
+                      (D, "Registros", "header"), (E, "Valor", "header")])
+        for e in impacto["renglones"] + impacto["topes"]:
+            filas.append([(B, e["codigo"], "label"), (C, e["descripcion"], None),
+                          (D, e["registros"], "money"), (E, int(round(e["valor"])), "money")])
+        if impacto["sin_clasificar"]["registros"]:
+            filas.append([(B, "SIN CLASIFICAR", "label"),
+                          (C, "sin codigo de renglon en 'Uso declaracion Sugerida'", None),
+                          (D, impacto["sin_clasificar"]["registros"], "money"),
+                          (E, int(round(impacto["sin_clasificar"]["valor"])), "money")])
+        filas.append([])
+
+    def bloque_detalle(titulo, regs, con_anterior=False):
+        if not regs:
+            return
+        filas.append([(B, titulo, "titulo"), (C, "", "titulo"), (D, "", "titulo"),
+                      (E, "", "titulo"), (F, "", "titulo")])
+        cab = [(B, "NIT", "header"), (C, "Tercero", "header"),
+               (D, "Detalle", "header"), (E, "Valor", "header")]
+        if con_anterior:
+            cab.append((F, "Valor anterior", "header"))
+        filas.append(cab)
+        for r in regs:
+            fila = [(B, r["nit"], None), (C, r["tercero"], None),
+                    (D, r["detalle"], None), (E, int(round(r["valor"])), "money")]
+            if con_anterior:
+                fila.append((F, int(round(r["valor_anterior"])), "money"))
+            filas.append(fila)
+        filas.append([])
+
+    bloque_detalle("REGISTROS NUEVOS", nuevos)
+    bloque_detalle("REGISTROS CON VALOR CAMBIADO", cambiados, con_anterior=True)
+    bloque_detalle("REGISTROS DESAPARECIDOS", desaparecidos)
+    return filas
+
+
+def write_dian_table(content: bytes, sheet_title: str, filas: list) -> bytes:
+    """Escribe el cuadro al final de la hoja nueva, con la misma cirugía de
+    ZIP/XML del Módulo 1: solo se tocan el XML de esa hoja y styles.xml.
+
+    OJO: por idempotencia se borra todo lo que haya desde la fila del
+    marcador hacia abajo. El cuadro siempre va al final, así que no debería
+    haber nada más ahí; no escribas notas manuales debajo del cuadro.
+    """
+    zin = zipfile.ZipFile(io.BytesIO(content))
+    sheet_path = _sheet_xml_path(zin, sheet_title)
+    sxml = zin.read(sheet_path).decode("utf-8")
+    styles_xml, st = _augment_styles(zin.read("xl/styles.xml").decode("utf-8"))
+
+    row_re = re.compile(r'<row r="(\d+)"[^>]*?(?:/>|>.*?</row>)', re.DOTALL)
+    sst_idx = _indices_sharedstrings(zin, MARCADOR_DIAN)
+    cell_s_re = re.compile(r'<c\b[^>]*\bt="s"[^>]*>\s*<v>(\d+)</v>')
+
+    title_row = None
+    for m in row_re.finditer(sxml):
+        bloque = m.group(0)
+        if MARCADOR_DIAN in bloque or (
+                sst_idx and any(int(cm.group(1)) in sst_idx
+                                for cm in cell_s_re.finditer(bloque))):
+            title_row = int(m.group(1))
+            break
+    if title_row is not None:
+        sxml = row_re.sub(lambda m: "" if int(m.group(1)) >= title_row else m.group(0), sxml)
+
+    existentes = [int(x) for x in re.findall(r'<row r="(\d+)"', sxml)]
+    start = (max(existentes) if existentes else 1) + 2
+
+    def celda(col, r, valor, kind):
+        if kind in ("money", "pct"):
+            return '<c r="%s%d" s="%d"><v>%s</v></c>' % (col, r, st[kind], valor)
+        s_attr = ' s="%d"' % st[kind] if kind in st else ""
+        return ('<c r="%s%d"%s t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
+                % (col, r, s_attr, escape(str(valor))))
+
+    rows_xml = []
+    for i, fila in enumerate(filas):
+        r = start + i
+        cuerpo = "".join(celda(col, r, val, kind) for col, val, kind in fila)
+        rows_xml.append('<row r="%d">%s</row>' % (r, cuerpo))
+
+    idx = sxml.rfind("</sheetData>")
+    if idx == -1:
+        raise HTTPException(500, "XML de hoja sin </sheetData>; estructura inesperada")
+    new_sxml = sxml[:idx] + "".join(rows_xml) + sxml[idx:]
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == sheet_path:
+                data = new_sxml.encode("utf-8")
+            elif item.filename == "xl/styles.xml":
+                data = styles_xml.encode("utf-8")
+            zi = zipfile.ZipInfo(item.filename, date_time=item.date_time)
+            zi.compress_type = item.compress_type
+            zi.external_attr = item.external_attr
+            zout.writestr(zi, data)
+    zin.close()
+    return out.getvalue()
+
+
+def procesar_modulo_dian(wb):
+    """Devuelve el resultado del Módulo 2, o None si no aplica (menos de dos
+    hojas REPORTE DIAN con estructura de reporte)."""
+    hojas = []
+    for ws in wb.worksheets:
+        if not _norm_title(ws.title).startswith(DIAN_PREFIJO):
+            continue
+        try:
+            hr = _header_row_dian(ws)
+        except HTTPException:
+            continue          # se llama REPORTE DIAN pero no tiene la estructura
+        fecha = _fecha_reporte_dian(ws, hr)
+        hojas.append({"ws": ws, "hoja": ws.title, "header_row": hr,
+                      "fecha": fecha, "clave": _clave_fecha(fecha)})
+    if len(hojas) < 2:
+        return None
+
+    hojas.sort(key=lambda h: h["clave"])
+    base_m, nueva_m = hojas[0], hojas[-1]
+
+    base = _leer_registros_dian(base_m["ws"], base_m["header_row"],
+                                _map_columns_dian(base_m["ws"], base_m["header_row"]))
+    nueva = _leer_registros_dian(nueva_m["ws"], nueva_m["header_row"],
+                                 _map_columns_dian(nueva_m["ws"], nueva_m["header_row"]))
+
+    sin_cambio, cambiados, nuevos, desaparecidos, ambiguos = comparar_registros_dian(base, nueva)
+    impacto = impacto_dian(nuevos, cambiados)
+    filas = construir_cuadro_dian(base_m, nueva_m, sin_cambio, cambiados,
+                                  nuevos, desaparecidos, impacto)
+    limpiar = lambda regs: [{k: v for k, v in r.items() if k != "fila"} for r in regs]
+    return {
+        "hoja_base": base_m["hoja"],
+        "fecha_base": base_m["fecha"],
+        "hoja_nueva": nueva_m["hoja"],
+        "fecha_nueva": nueva_m["fecha"],
+        "hojas_detectadas": [{"hoja": h["hoja"], "fecha": h["fecha"]} for h in hojas],
+        "conteos": {"base": len(base), "nueva": len(nueva),
+                    "sin_cambio": len(sin_cambio), "cambiados": len(cambiados),
+                    "nuevos": len(nuevos), "desaparecidos": len(desaparecidos)},
+        "impacto": impacto,
+        "nuevos": limpiar(nuevos),
+        "cambiados": limpiar(cambiados),
+        "desaparecidos": limpiar(desaparecidos),
+        "ambiguos": limpiar(ambiguos),
+        "filas_cuadro": len(filas),
+        "_filas": filas,
+    }
+
+
+@app.post("/dian-preview")
+async def dian_preview(file: UploadFile = File(...), x_service_token: str = Header(default="")):
+    """Corre el Módulo 2 y devuelve el resultado SIN escribir nada.
+
+    Permite validar la comparación (cuántos nuevos, cuánto impacto, si el
+    emparejamiento tiene sentido) antes de dejar que toque un archivo real.
+    """
+    if SERVICE_TOKEN and x_service_token != SERVICE_TOKEN:
+        raise HTTPException(401, "Token de servicio inválido")
+
+    content = await file.read()
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(content), keep_vba=True, data_only=False)
+    except Exception as e:
+        raise HTTPException(400, f"No se pudo abrir el archivo .xlsm: {e}")
+
+    candidatas = [w.title for w in wb.worksheets
+                  if _norm_title(w.title).startswith(DIAN_PREFIJO)]
+    try:
+        dian = procesar_modulo_dian(wb)
+    finally:
+        wb.close()
+
+    if dian is None:
+        return {"aplica": False,
+                "hojas_con_nombre_reporte_dian": candidatas,
+                "motivo": "Se necesitan dos hojas REPORTE DIAN con estructura de reporte "
+                          "(fila de encabezados con NIT, Detalle y Valor)"}
+    dian.pop("_filas", None)
+    return {"aplica": True, "archivo": file.filename, **dian}
 
 
 # ---------------------------------------------------------------------------
